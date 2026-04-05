@@ -18,9 +18,9 @@ jobs:
       - name: Set up Python
         run: uv python install
       - name: Install deps
-        run: ./Taskfile dev-install
+        run: bash ./Taskfile dev-install
       - name: Ruff check
-        run: ./Taskfile lint
+        run: bash ./Taskfile lint
 
   typecheck:
     name: Typecheck (mypy)
@@ -34,9 +34,9 @@ jobs:
       - name: Set up Python
         run: uv python install
       - name: Install deps
-        run: ./Taskfile dev-install
+        run: bash ./Taskfile dev-install
       - name: mypy
-        run: ./Taskfile typecheck
+        run: bash ./Taskfile typecheck
 
   tests:
     name: Unit Tests
@@ -49,6 +49,6 @@ jobs:
       - name: Set up Python
         run: uv python install
       - name: Install deps
-        run: ./Taskfile dev-install
+        run: bash ./Taskfile dev-install
       - name: Run unit tests (no network)
-        run: ./Taskfile test-unit
+        run: bash ./Taskfile test-unit

@@ -48,13 +48,13 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: ./Taskfile docs-install
+        run: bash ./Taskfile docs-install
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
       - name: Build documentation
-        run: ./Taskfile docs-build
+        run: bash ./Taskfile docs-build
         env:
           ENABLE_MKDOCSTRINGS: true
 
@@ -92,10 +92,10 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: ./Taskfile docs-install
+        run: bash ./Taskfile docs-install
 
       - name: Check documentation links
-        run: ./Taskfile docs-build
+        run: bash ./Taskfile docs-build
         env:
           ENABLE_MKDOCSTRINGS: true
 
@@ -104,7 +104,7 @@ jobs:
           # Install linkchecker if needed
           pip install linkchecker
           # Start a local server
-          ./Taskfile docs-serve &
+          bash ./Taskfile docs-serve &
           SERVER_PID=$!
           sleep 5
           # Check for broken links
