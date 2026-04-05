@@ -1,0 +1,27 @@
+services:
+  ccproxy:
+    container_name: ccproxy-codex-gateway
+    image: ${CCPROXY_IMAGE:-ghcr.io/devilangla/ccproxy-codex-gateway:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:1455:1455"
+    environment:
+      SERVER__HOST: 0.0.0.0
+      SERVER__PORT: 8000
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: plain
+      CONFIG_FILE: /root/.config/ccproxy/config.toml
+    volumes:
+      - ./config:/root/.config/ccproxy
+      - ./codex:/root/.codex
+      - ./logs:/tmp/ccproxy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

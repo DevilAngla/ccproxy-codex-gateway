@@ -1,0 +1,199 @@
+name: Build Distribution Packages
+
+on:
+  release:
+    types: [published]
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.1.4)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.normalize.outputs.version }}
+      release_tag: ${{ steps.normalize.outputs.release_tag }}
+    steps:
+      - name: Normalize version and release tag
+        id: normalize
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RAW_VALUE="${{ github.event.release.tag_name }}"
+          else
+            RAW_VALUE="${{ inputs.version }}"
+          fi
+
+          RAW_VALUE="${RAW_VALUE#refs/tags/}"
+          NORMALIZED_VERSION="${RAW_VALUE#v}"
+
+          if [ -z "$NORMALIZED_VERSION" ]; then
+            echo "::error::Unable to resolve version input"
+            exit 1
+          fi
+
+          RELEASE_TAG="v${NORMALIZED_VERSION}"
+
+          echo "version=${NORMALIZED_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+  preflight:
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      has_debian: ${{ steps.inspect.outputs.has_debian }}
+      debian_arches: ${{ steps.inspect.outputs.debian_arches }}
+      has_alpine: ${{ steps.inspect.outputs.has_alpine }}
+      has_termux: ${{ steps.inspect.outputs.has_termux }}
+      debian_reason: ${{ steps.inspect.outputs.debian_reason }}
+      alpine_reason: ${{ steps.inspect.outputs.alpine_reason }}
+      termux_reason: ${{ steps.inspect.outputs.termux_reason }}
+    steps:
+      - name: Inspect release assets
+        id: inspect
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+          RELEASE_TAG="${{ needs.prepare.outputs.release_tag }}"
+          TOOL="ccproxy"
+
+          GNU_AMD64_ASSET="${TOOL}-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          GNU_ARM64_ASSET="${TOOL}-${RELEASE_TAG}-aarch64-unknown-linux-gnu.tar.gz"
+          MUSL_X86_ASSET="${TOOL}-${RELEASE_TAG}-x86_64-unknown-linux-musl.tar.gz"
+          MUSL_ARM_ASSET="${TOOL}-${RELEASE_TAG}-aarch64-unknown-linux-musl.tar.gz"
+          ANDROID_ASSET="${TOOL}-${RELEASE_TAG}-aarch64-linux-android.tar.gz"
+
+          HAS_DEBIAN="false"
+          DEBIAN_ARCHES="[]"
+          HAS_ALPINE="false"
+          HAS_TERMUX="false"
+          DEBIAN_REASON="release_not_found"
+          ALPINE_REASON="release_not_found"
+          TERMUX_REASON="release_not_found"
+
+          if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            ASSET_NAMES="$(gh release view "$RELEASE_TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
+
+            has_asset() {
+              local expected="$1"
+              printf '%s\n' "$ASSET_NAMES" | grep -Fxq "$expected"
+            }
+
+            DEBIAN_FOUND=()
+            if has_asset "$GNU_AMD64_ASSET"; then
+              DEBIAN_FOUND+=("amd64")
+            fi
+            if has_asset "$GNU_ARM64_ASSET"; then
+              DEBIAN_FOUND+=("arm64")
+            fi
+
+            if [ "${#DEBIAN_FOUND[@]}" -gt 0 ]; then
+              HAS_DEBIAN="true"
+              if [ "${#DEBIAN_FOUND[@]}" -eq 1 ]; then
+                DEBIAN_REASON="ready_${DEBIAN_FOUND[0]}"
+              else
+                DEBIAN_REASON="ready_all"
+              fi
+              DEBIAN_ARCHES="$(printf '%s\n' "${DEBIAN_FOUND[@]}" | jq -R . | jq -s -c .)"
+            else
+              DEBIAN_REASON="missing_${GNU_AMD64_ASSET}_and_${GNU_ARM64_ASSET}"
+            fi
+
+            if has_asset "$MUSL_X86_ASSET" && has_asset "$MUSL_ARM_ASSET"; then
+              HAS_ALPINE="true"
+              ALPINE_REASON="ready"
+            else
+              ALPINE_REASON="missing_${MUSL_X86_ASSET}_or_${MUSL_ARM_ASSET}"
+            fi
+
+            if has_asset "$ANDROID_ASSET"; then
+              HAS_TERMUX="true"
+              TERMUX_REASON="ready"
+            else
+              TERMUX_REASON="missing_${ANDROID_ASSET}"
+            fi
+          fi
+
+          echo "has_debian=${HAS_DEBIAN}" >> "$GITHUB_OUTPUT"
+          echo "debian_arches=${DEBIAN_ARCHES}" >> "$GITHUB_OUTPUT"
+          echo "has_alpine=${HAS_ALPINE}" >> "$GITHUB_OUTPUT"
+          echo "has_termux=${HAS_TERMUX}" >> "$GITHUB_OUTPUT"
+          echo "debian_reason=${DEBIAN_REASON}" >> "$GITHUB_OUTPUT"
+          echo "alpine_reason=${ALPINE_REASON}" >> "$GITHUB_OUTPUT"
+          echo "termux_reason=${TERMUX_REASON}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Package asset preflight"
+            echo "- release tag: \\`${RELEASE_TAG}\\`"
+            echo "- debian sources \\`${GNU_AMD64_ASSET}\\`, \\`${GNU_ARM64_ASSET}\\`: ${HAS_DEBIAN} (${DEBIAN_REASON})"
+            echo "- debian selected arches: \\`${DEBIAN_ARCHES}\\`"
+            echo "- alpine sources \\`${MUSL_X86_ASSET}\\`, \\`${MUSL_ARM_ASSET}\\`: ${HAS_ALPINE} (${ALPINE_REASON})"
+            echo "- termux source \\`${ANDROID_ASSET}\\`: ${HAS_TERMUX} (${TERMUX_REASON})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  alpine:
+    needs: [prepare, preflight]
+    if: ${{ needs.preflight.outputs.has_alpine == 'true' }}
+    uses: CaddyGlow/homebrew-packages/.github/workflows/package-alpine.yml@main
+    permissions:
+      contents: write
+    with:
+      tool: ccproxy
+      version: ${{ needs.prepare.outputs.version }}
+      repository: ${{ github.repository }}
+      release_tag: ${{ needs.prepare.outputs.release_tag }}
+
+  debian:
+    needs: [prepare, preflight]
+    if: ${{ needs.preflight.outputs.has_debian == 'true' }}
+    uses: CaddyGlow/homebrew-packages/.github/workflows/package-debian.yml@main
+    permissions:
+      contents: write
+    with:
+      tool: ccproxy
+      version: ${{ needs.prepare.outputs.version }}
+      architectures: ${{ needs.preflight.outputs.debian_arches }}
+      repository: ${{ github.repository }}
+      release_tag: ${{ needs.prepare.outputs.release_tag }}
+
+  termux:
+    needs: [prepare, preflight]
+    if: ${{ needs.preflight.outputs.has_termux == 'true' }}
+    uses: CaddyGlow/homebrew-packages/.github/workflows/package-termux.yml@main
+    permissions:
+      contents: write
+    with:
+      tool: ccproxy
+      version: ${{ needs.prepare.outputs.version }}
+      repository: ${{ github.repository }}
+      release_tag: ${{ needs.prepare.outputs.release_tag }}
+
+  summary:
+    needs: [prepare, preflight, alpine, debian, termux]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize package workflow
+        shell: bash
+        run: |
+          {
+            echo "### Distribution packaging summary"
+            echo "- version: \\`${{ needs.prepare.outputs.version }}\\`"
+            echo "- release tag: \\`${{ needs.prepare.outputs.release_tag }}\\`"
+            echo "- debian job: ${{ needs.debian.result }} (${{ needs.preflight.outputs.debian_reason }})"
+            echo "- alpine job: ${{ needs.alpine.result }} (${{ needs.preflight.outputs.alpine_reason }})"
+            echo "- termux job: ${{ needs.termux.result }} (${{ needs.preflight.outputs.termux_reason }})"
+          } >> "$GITHUB_STEP_SUMMARY"

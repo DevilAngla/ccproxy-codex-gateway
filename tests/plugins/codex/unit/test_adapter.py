@@ -1,0 +1,603 @@
+"""Unit tests for CodexAdapter."""
+
+import json
+from typing import cast
+from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
+
+from ccproxy.models.detection import DetectedHeaders, DetectedPrompts
+from ccproxy.plugins.codex.adapter import CodexAdapter
+from ccproxy.plugins.codex.detection_service import CodexDetectionService
+from ccproxy.plugins.oauth_codex.manager import CodexTokenManager
+
+
+class TestCodexAdapter:
+    """Test the CodexAdapter HTTP adapter methods."""
+
+    @pytest.fixture
+    def mock_detection_service(self) -> Mock:
+        """Create mock detection service."""
+        service = Mock(spec=CodexDetectionService)
+        service.get_cached_data = Mock(return_value=None)
+        instructions_value = "Mock detection instructions"
+        prompts = DetectedPrompts.from_body({"instructions": instructions_value})
+        service.get_detected_prompts = Mock(return_value=prompts)
+        service.get_system_prompt = Mock(return_value=prompts.instructions_payload())
+        headers = DetectedHeaders(
+            {
+                "session_id": "session-123",
+                "chatgpt-account-id": "test-account-123",
+                "authorization": "existing-auth",  # will be filtered
+            }
+        )
+        service.get_detected_headers = Mock(return_value=headers)
+        service.get_ignored_headers = Mock(
+            return_value=list(CodexDetectionService.ignores_header)
+        )
+        service.get_redacted_headers = Mock(
+            return_value=list(CodexDetectionService.REDACTED_HEADERS)
+        )
+        service.instructions_value = instructions_value
+        return service
+
+    @pytest.fixture
+    def mock_auth_manager(self) -> Mock:
+        """Create mock auth manager."""
+        auth_manager = Mock(spec=CodexTokenManager)
+        auth_manager.get_access_token = AsyncMock(return_value="test-token")
+        auth_manager.get_access_token_with_refresh = AsyncMock(
+            return_value="test-token"
+        )
+
+        credentials = Mock()
+        credentials.access_token = "test-token"
+        auth_manager.load_credentials = AsyncMock(return_value=credentials)
+        auth_manager.should_refresh = Mock(return_value=False)
+        auth_manager.get_token_snapshot = AsyncMock(return_value=None)
+
+        profile = Mock()
+        profile.chatgpt_account_id = "test-account-123"
+        auth_manager.get_profile_quick = AsyncMock(return_value=profile)
+        return auth_manager
+
+    @pytest.fixture
+    def mock_http_pool_manager(self) -> Mock:
+        """Create mock HTTP pool manager."""
+        return Mock()
+
+    @pytest.fixture
+    def mock_config(self) -> Mock:
+        """Create mock config."""
+        config = Mock()
+        config.base_url = "https://chat.openai.com/backend-anon"
+        return config
+
+    @pytest.fixture
+    def adapter(
+        self,
+        mock_detection_service: Mock,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+        mock_config: Mock,
+    ) -> CodexAdapter:
+        """Create CodexAdapter instance."""
+        return CodexAdapter(
+            detection_service=mock_detection_service,
+            config=mock_config,
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+    @pytest.fixture
+    def adapter_with_disabled_detection(
+        self,
+        mock_detection_service: Mock,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> CodexAdapter:
+        """Create CodexAdapter with detection payload injection disabled."""
+        mock_config = Mock()
+        mock_config.base_url = "https://chat.openai.com/backend-anon"
+        mock_config.inject_detection_payload = False
+
+        return CodexAdapter(
+            detection_service=mock_detection_service,
+            config=mock_config,
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_target_url(self, adapter: CodexAdapter) -> None:
+        """Test target URL generation."""
+        url = await adapter.get_target_url("/responses")
+        assert url == "https://chat.openai.com/backend-anon/responses"
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_basic(self, adapter: CodexAdapter) -> None:
+        """Test basic provider request preparation."""
+        body_dict = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-4",
+        }
+        body = json.dumps(body_dict).encode()
+        headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer old-token",  # Should be overridden
+        }
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        # Body should preserve original format but add Codex-specific fields
+        result_data = json.loads(result_body.decode())
+        assert "messages" in result_data  # Original format preserved
+        assert result_data["stream"] is True  # Always set to True for Codex
+        assert "instructions" in result_data
+
+        # Headers should be filtered and enhanced
+        assert result_headers["content-type"] == "application/json"
+        assert result_headers["authorization"] == "Bearer test-token"
+        assert result_headers["chatgpt-account-id"] == "test-account-123"
+        assert "session_id" in result_headers
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_with_instructions(
+        self,
+        mock_detection_service: Mock,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> None:
+        """Test request preparation with custom instructions."""
+        # Setup detection service with custom instructions
+        prompts = DetectedPrompts.from_body(
+            {"instructions": "You are a Python expert."}
+        )
+        mock_detection_service.get_detected_prompts = Mock(return_value=prompts)
+        mock_detection_service.get_system_prompt = Mock(
+            return_value=prompts.instructions_payload()
+        )
+
+        mock_config = Mock()
+        mock_config.base_url = "https://chat.openai.com/backend-anon"
+
+        adapter = CodexAdapter(
+            detection_service=mock_detection_service,
+            config=mock_config,
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+        body_dict = {
+            "messages": [{"role": "user", "content": "Write a function"}],
+            "model": "gpt-4",
+        }
+        body = json.dumps(body_dict).encode()
+        headers = {"content-type": "application/json"}
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        # Body should have custom instructions
+        result_data = json.loads(result_body.decode())
+        assert result_data["instructions"] == "You are a Python expert."
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_preserves_existing_instructions(
+        self, adapter: CodexAdapter
+    ) -> None:
+        """Test that existing instructions are preserved."""
+        body_dict = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-4",
+            "instructions": "You are a JavaScript expert.",
+        }
+        body = json.dumps(body_dict).encode()
+        headers = {"content-type": "application/json"}
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        # Should keep existing instructions
+        result_data = json.loads(result_body.decode())
+        expected_instructions = getattr(
+            adapter.detection_service,
+            "instructions_value",
+            "Mock detection instructions",
+        )
+        assert (
+            result_data["instructions"]
+            == f"{expected_instructions}\nYou are a JavaScript expert."
+        )
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_sets_stream_true(
+        self, adapter: CodexAdapter
+    ) -> None:
+        """Test that stream is always set to True."""
+        body_dict = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-4",
+            "stream": False,  # Should be overridden
+        }
+        body = json.dumps(body_dict).encode()
+        headers = {"content-type": "application/json"}
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        # Stream should always be True for Codex
+        result_data = json.loads(result_body.decode())
+        assert result_data["stream"] is True
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_removes_max_completion_tokens(
+        self, adapter: CodexAdapter
+    ) -> None:
+        body_dict = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-4",
+            "max_completion_tokens": 321,
+        }
+        body = json.dumps(body_dict).encode()
+
+        result_body, _ = await adapter.prepare_provider_request(
+            body, {"content-type": "application/json"}, "/responses"
+        )
+
+        result_data = json.loads(result_body.decode())
+        assert "max_output_tokens" not in result_data
+        assert "max_completion_tokens" not in result_data
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_preserves_encoded_body(
+        self, adapter: CodexAdapter
+    ) -> None:
+        """Encoded request bodies should pass through unchanged."""
+        body = b"\x28\xb5\x2f\xfdcompressed-request"
+        headers = {
+            "content-type": "application/json",
+            "content-encoding": "zstd",
+            "accept": "application/json, text/event-stream",
+            "authorization": "Bearer old-token",
+            "session_id": "existing-session",
+        }
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        assert result_body == body
+        assert result_headers["content-encoding"] == "zstd"
+        assert result_headers["authorization"] == "Bearer test-token"
+        assert result_headers["session_id"] == "existing-session"
+        assert "conversation_id" in result_headers
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_strips_content_encoding_for_plain_body(
+        self, adapter: CodexAdapter
+    ) -> None:
+        """When body is not encoded, content-encoding must not be forwarded."""
+        body_dict = {
+            "input": [{"type": "message", "role": "user", "content": "Hello"}],
+            "model": "gpt-4",
+        }
+        body = json.dumps(body_dict).encode()
+        headers = {
+            "content-type": "application/json",
+            "content-encoding": "identity",
+        }
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        result_data = json.loads(result_body.decode())
+        assert result_data["stream"] is True
+        assert "content-encoding" not in result_headers
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_wraps_string_input_for_responses(
+        self, adapter: CodexAdapter
+    ) -> None:
+        """Plain-string Responses input should be normalized for Codex."""
+        body = json.dumps(
+            {
+                "model": "gpt-5.4",
+                "input": "Reply with exactly: OK",
+                "store": True,
+            }
+        ).encode()
+
+        result_body, _ = await adapter.prepare_provider_request(
+            body, {"content-type": "application/json"}, "/responses"
+        )
+
+        result_data = json.loads(result_body.decode())
+        assert result_data["stream"] is True
+        assert result_data["store"] is False
+        assert result_data["input"] == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Reply with exactly: OK"}
+                ],
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_applies_codex_template_defaults(
+        self,
+        mock_detection_service: Mock,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> None:
+        template = {
+            "instructions": "You are a Python expert.",
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "medium"},
+            "tool_choice": "auto",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "prompt_cache_key": "template-cache-key",
+        }
+        prompts = DetectedPrompts.from_body(template)
+        mock_detection_service.get_detected_prompts = Mock(return_value=prompts)
+        mock_detection_service.get_system_prompt = Mock(
+            return_value=prompts.instructions_payload()
+        )
+
+        mock_config = Mock()
+        mock_config.base_url = "https://chat.openai.com/backend-anon"
+
+        adapter = CodexAdapter(
+            detection_service=mock_detection_service,
+            config=mock_config,
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "input": [{"role": "user", "content": [{"type": "input_text"}]}],
+            }
+        ).encode()
+
+        result_body, _ = await adapter.prepare_provider_request(body, {}, "/responses")
+        result_data = json.loads(result_body.decode())
+
+        assert result_data["include"] == ["reasoning.encrypted_content"]
+        assert result_data["parallel_tool_calls"] is True
+        assert result_data["reasoning"] == {"effort": "medium"}
+        assert result_data["tool_choice"] == "auto"
+        assert result_data["tools"] == [{"type": "function", "name": "exec_command"}]
+        assert result_data["prompt_cache_key"] != "template-cache-key"
+        assert result_data["input"][0]["type"] == "message"
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_skips_detection_payload_when_disabled(
+        self,
+        adapter_with_disabled_detection: CodexAdapter,
+        mock_detection_service: Mock,
+    ) -> None:
+        """Verify that detection payload is not injected when disabled in config."""
+        template = {
+            "instructions": "You are a Python expert.",
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "medium"},
+            "tool_choice": "auto",
+            "tools": [{"type": "function", "name": "exec_command"}],
+        }
+        prompts = DetectedPrompts.from_body(template)
+        mock_detection_service.get_detected_prompts = Mock(return_value=prompts)
+        mock_detection_service.get_system_prompt = Mock(
+            return_value=prompts.instructions_payload()
+        )
+
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "instructions": "User supplied instructions",
+                "input": [{"role": "user", "content": [{"type": "input_text"}]}],
+            }
+        ).encode()
+
+        result_body, _ = await adapter_with_disabled_detection.prepare_provider_request(
+            body, {}, "/responses"
+        )
+        result_data = json.loads(result_body.decode())
+
+        # When detection is disabled, user instructions are preserved
+        assert result_data["instructions"] == "User supplied instructions"
+        # Template fields should not be injected
+        assert "include" not in result_data
+        assert "parallel_tool_calls" not in result_data
+        assert "reasoning" not in result_data
+        assert "tool_choice" not in result_data
+        assert "tools" not in result_data
+        # Input type normalization still occurs
+        assert result_data["input"][0]["type"] == "message"
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_keeps_msaf_reasoning_when_detection_disabled(
+        self, adapter_with_disabled_detection: CodexAdapter
+    ) -> None:
+        """Verify that user-supplied reasoning is preserved when detection is disabled.
+
+        This ensures that even with detection disabled, legitimate MSAF reasoning
+        parameters from the user are not stripped.
+        """
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "instructions": "Workshop instructions",
+                "reasoning": {"effort": "medium", "summary": "auto"},
+                "temperature": 0.2,
+                "max_tokens": 128,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Draft login form requirements.",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ).encode()
+
+        result_body, _ = await adapter_with_disabled_detection.prepare_provider_request(
+            body, {}, "/responses"
+        )
+        result_data = json.loads(result_body.decode())
+
+        assert result_data["instructions"] == "Workshop instructions"
+        assert result_data["reasoning"] == {"effort": "medium", "summary": "auto"}
+        assert result_data["stream"] is True
+        assert result_data["store"] is False
+        # Provider-specific params are normalized/removed
+        assert "temperature" not in result_data
+        assert "max_tokens" not in result_data
+
+    @pytest.mark.asyncio
+    async def test_process_provider_response(self, adapter: CodexAdapter) -> None:
+        """Test response processing and format conversion."""
+        # Mock Codex response format
+        codex_response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "text", "text": "Hello! How can I help?"}],
+                }
+            ]
+        }
+        mock_response = Mock(spec=httpx.Response)
+        mock_response.status_code = 200
+        mock_response.content = json.dumps(codex_response).encode()
+        mock_response.headers = {
+            "content-type": "application/json",
+            "x-response-id": "resp-123",
+        }
+
+        result = await adapter.process_provider_response(mock_response, "/responses")
+
+        assert result.status_code == 200
+        # Adapter now returns response as-is; format conversion handled upstream
+        result_data = json.loads(cast(bytes, result.body))
+        # Should return original Codex response unchanged
+        assert result_data == codex_response
+        assert result.headers.get("content-type") == "application/json"
+
+    @pytest.mark.asyncio
+    async def test_cli_headers_injection(
+        self,
+        mock_detection_service: Mock,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> None:
+        """Test CLI headers injection."""
+        # Setup detection service with CLI headers
+        cli_headers = DetectedHeaders(
+            {
+                "X-CLI-Version": "1.0.0",
+                "X-Session-ID": "cli-session-123",
+            }
+        )
+        instructions_value = getattr(
+            mock_detection_service, "instructions_value", "Mock detection instructions"
+        )
+        mock_detection_service.get_detected_headers = Mock(return_value=cli_headers)
+        prompts = DetectedPrompts.from_body({"instructions": instructions_value})
+        mock_detection_service.get_detected_prompts = Mock(return_value=prompts)
+        mock_detection_service.get_system_prompt = Mock(
+            return_value=prompts.instructions_payload()
+        )
+
+        mock_config = Mock()
+        mock_config.base_url = "https://chat.openai.com/backend-anon"
+
+        adapter = CodexAdapter(
+            detection_service=mock_detection_service,
+            config=mock_config,
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+        body_dict = {"messages": [{"role": "user", "content": "Hello"}]}
+        body = json.dumps(body_dict).encode()
+        headers = {"content-type": "application/json"}
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        # Should include CLI headers (normalized to lowercase)
+        assert result_headers["x-cli-version"] == "1.0.0"
+        assert result_headers["x-session-id"] == "cli-session-123"
+
+    def test_get_instructions_default(self, adapter: CodexAdapter) -> None:
+        """Test default instructions when no detection service data."""
+        instructions = adapter._get_instructions()
+        expected = getattr(
+            adapter.detection_service,
+            "instructions_value",
+            "Mock detection instructions",
+        )
+        assert instructions == expected
+
+    def test_get_instructions_from_detection_service(
+        self,
+        mock_detection_service: Mock,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> None:
+        """Test instructions from detection service."""
+        prompts = DetectedPrompts.from_body({"instructions": "Custom instructions"})
+        mock_detection_service.get_detected_prompts = Mock(return_value=prompts)
+        mock_detection_service.get_system_prompt = Mock(
+            return_value=prompts.instructions_payload()
+        )
+
+        mock_config = Mock()
+        mock_config.base_url = "https://chat.openai.com/backend-anon"
+
+        adapter = CodexAdapter(
+            detection_service=mock_detection_service,
+            config=mock_config,
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+        instructions = adapter._get_instructions()
+        assert instructions == "Custom instructions"
+
+    @pytest.mark.asyncio
+    async def test_auth_data_usage(
+        self, adapter: CodexAdapter, mock_auth_manager: Mock
+    ) -> None:
+        """Test that auth data is properly used."""
+        body = b'{"messages": []}'
+        headers = {"content-type": "application/json"}
+
+        result_body, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/responses"
+        )
+
+        # Verify auth manager was called
+        mock_auth_manager.get_access_token.assert_awaited()
+
+        # Verify auth headers are set
+        assert result_headers["authorization"] == "Bearer test-token"
+        assert result_headers["chatgpt-account-id"] == "test-account-123"

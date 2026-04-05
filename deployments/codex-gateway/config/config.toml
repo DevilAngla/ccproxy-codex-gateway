@@ -1,0 +1,73 @@
+enable_plugins = true
+enabled_plugins = ["oauth_codex", "codex", "request_tracer", "credential_balancer"]
+
+[server]
+host = "0.0.0.0"
+port = 8000
+log_level = "INFO"
+
+[security]
+enable_auth = false
+
+[cors]
+allow_origins = ["*"]
+allow_credentials = true
+allow_methods = ["*"]
+allow_headers = ["*"]
+
+[logging]
+level = "INFO"
+format = "plain"
+plugin_log_base_dir = "/tmp/ccproxy"
+
+[plugins.request_tracer]
+enabled = true
+verbose_api = false
+json_logs_enabled = true
+raw_http_enabled = false
+log_dir = "/tmp/ccproxy/traces"
+
+[plugins.oauth_codex]
+enabled = true
+
+[plugins.codex]
+enabled = true
+auth_manager = "codex_credential_balancer"
+model_mappings = []
+
+[[plugins.codex.models_endpoint]]
+id = "gpt-5.4"
+object = "model"
+created = 1735689600
+owned_by = "openai"
+root = "gpt-5.4"
+permission = []
+
+[[plugins.codex.models_endpoint]]
+id = "gpt-5.3-codex"
+object = "model"
+created = 1723075200
+owned_by = "openai"
+root = "gpt-5.3-codex"
+permission = []
+
+[[plugins.codex.models_endpoint]]
+id = "gpt-5.2-codex"
+object = "model"
+created = 1726444800
+owned_by = "openai"
+root = "gpt-5.2-codex"
+permission = []
+
+[plugins.credential_balancer]
+enabled = true
+
+[[plugins.credential_balancer.providers]]
+provider = "codex"
+strategy = "failover"
+manager_class = "ccproxy.plugins.oauth_codex.manager.CodexTokenManager"
+storage_class = "ccproxy.plugins.oauth_codex.storage.CodexTokenStorage"
+
+[[plugins.credential_balancer.providers.credentials]]
+file = "/root/.config/ccproxy/credentials/account-01.json"
+label = "account-01"
